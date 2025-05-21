@@ -1,59 +1,86 @@
+The script starts the node itself. So you can run the node from the script with the command **screen -S autorestart bash ~/autorestart_bash.sh**
 
-Temporary Solution for `Current_batch`, `Daemon Failed to Start`, and `Errno` Issues: Automatic Node Restart
+HOWEVER, this script is not designed for the initial installation of the node. The script only works with an already installed node.
 
----
+**Installation**
 
-Installation
+1. Create the first script:
 
-1. Update packages and install `expect`:
-
-sudo apt update && sudo apt install expect -y
-
-2. Create the autorestart script:
-
-
-nano ~/autorestart_1.sh
-
+`nano ~/start_gensyn_bash.sh`
 
 Paste the script below, then save and exit with `Ctrl + O`, `Enter`, `Ctrl + X`:
 
-```bash
-#!/usr/bin/env bash
+```
+#!/bin/bash
+
+cd ~/rl-swarm || exit 1
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Чтение параметров
+SWARM="$1"
+SIZE="$2"
+
+# Запуск с автоматическими ответами
+{
+    echo "Y"        # Testnet
+    sleep 1
+    echo "$SWARM"   # A or B
+    sleep 1
+    echo "$SIZE"    # 0.5, 1.5, etc.
+    sleep 1
+    echo "N"        # Push to HF
+} | ./run_rl_swarm.sh
+```
+
+Make scrypt executable 
+`chmod +x ~/start_gensyn_bash.sh`
+
+
+3. Create the second script:
+
+`nano ~/autorestart_bash.sh`
+
+Paste the script below, then save and exit with `Ctrl + O`, `Enter`, `Ctrl + X`:
+
+```
+#!/bin/bash
 
 LOG_FILE="$HOME/rl-swarm/gensynnode.log"
 RESTART_LOG="$HOME/gensyn_restart.log"
-COUNTER_FILE="$HOME/gensyn_restart_count.txt"
 PARAM_FILE="$HOME/gensyn_params.txt"
-DEBUG_LOG="$HOME/debug_check.txt"
+COUNTER_FILE="$HOME/gensyn_restart_count.txt"
+
+rm -f "$PARAM_FILE"
 
 ask_params() {
-    echo "[INFO] Please enter launch parameters manually."
-
-    while true; do
-        read -rp "Choose swarm type (A or B): " SWARM
-        if [[ "$SWARM" == "A" || "$SWARM" == "B" ]]; then
-            break
-        else
-            echo "Invalid input. Please enter A or B."
-        fi
-    done
-
-    while true; do
-        read -rp "Choose model size (0.5 / 1.5 / 7 / 32 / 72): " SIZE
-        if [[ "$SIZE" =~ ^(0.5|1.5|7|32|72)$ ]]; then
-            break
-        else
-            echo "Invalid input. Please enter one of: 0.5, 1.5, 7, 32, 72"
-        fi
-    done
-
+    echo "Choose swarm type (A or B):"
+    read SWARM
+    echo "Choose model size (0.5 / 1.5 / 7 / 32 / 72):"
+    read SIZE
     echo "$SWARM" > "$PARAM_FILE"
     echo "$SIZE" >> "$PARAM_FILE"
-    echo "Saved parameters: $SWARM, $SIZE"
 }
 
-log() {
-    echo -e "$1" | tee -a "$RESTART_LOG"
+stop_node() {
+    echo "[STEP] Stopping node..." | tee -a "$RESTART_LOG"
+    pkill -f run_rl_swarm.sh
+    pkill -f train_single_gpu
+}
+
+start_node() {
+    echo "[STEP] Starting node..." | tee -a "$RESTART_LOG"
+    readarray -t PARAMS < "$PARAM_FILE"
+    SWARM="${PARAMS[0]}"
+    SIZE="${PARAMS[1]}"
+    
+    > "$LOG_FILE"
+
+    screen -S gensynnode -dm bash -c "~/start_gensyn_bash.sh $SWARM $SIZE >> $LOG_FILE 2>&1"
+}
+
+has_error() {
+    grep -qE "current.?batch|UnboundLocalError|Daemon failed to start|FileNotFoundError" "$LOG_FILE"
 }
 
 increment_counter() {
@@ -63,132 +90,41 @@ increment_counter() {
     echo "$count"
 }
 
-stop_node() {
-    log "[STEP] Stopping node..."
-    pkill -f run_rl_swarm.sh
-    pkill -f train_single_gpu
-
-    PID=$(netstat -tulnp 2>/dev/null | grep :3000 | awk '{print $7}' | cut -d'/' -f1)
-    if [[ "$PID" =~ ^[0-9]+$ ]]; then
-        sudo kill "$PID"
-        log "[INFO] Killed process on port 3000: PID=$PID"
-    else
-        log "[WARN] Could not find valid PID for port 3000. Got: '$PID'"
-    fi
-}
-
-start_node() {
-    log "[STEP] Starting node inside screen..."
-
-    if screen -list | grep -q "gensynnode"; then
-        log "[INFO] Found old screen session 'gensynnode'. Closing it..."
-        screen -S gensynnode -X quit
-        sleep 2
-    fi
-
-    : > "$LOG_FILE"
-
-    screen -S gensynnode -d -m bash -c "$HOME/start_node.expect $SWARM $SIZE"
-}
-
-has_critical_error() {
-    awk '/Traceback \(most recent call last\)/ {t=1; c=0} t && c<50 { print; c++ }' "$LOG_FILE" |
-    tee "$DEBUG_LOG" |
-    grep -qF -e "UnboundLocalError: cannot access local variable 'current_batch'" \
-             -e "hivemind.p2p.p2p_daemon_bindings.utils.P2PDaemonError: Daemon failed to start in 30.0 seconds" \
-             -e "FileNotFoundError: [Errno 2] No such file or directory"
-}
-
-check_and_restart() {
-    log "[INFO] Log monitoring started: $(date)"
+monitor() {
+    echo "[INFO] Monitoring started: $(date)" | tee -a "$RESTART_LOG"
     while true; do
-        if has_critical_error; then
-            RESTART_COUNT=$(increment_counter)
-            log "[ERROR] Critical error found. Restarting node #$RESTART_COUNT..."
-
+        if has_error; then
+            CNT=$(increment_counter)
+            echo "[ERROR] Restarting node #$CNT..." | tee -a "$RESTART_LOG"
             stop_node
-            sleep 60
-
-            readarray -t PARAMS < "$PARAM_FILE"
-            SWARM="${PARAMS[0]}"
-            SIZE="${PARAMS[1]}"
-
+            sleep 10
             start_node
-            log "[✓] Restart completed. Waiting 5 minutes before re-checking logs..."
+            echo "[✓] Restarted at $(date)" | tee -a "$RESTART_LOG"
             sleep 300
         fi
-        sleep 10
+        sleep 15
     done
 }
 
 ask_params
-readarray -t PARAMS < "$PARAM_FILE"
-SWARM="${PARAMS[0]}"
-SIZE="${PARAMS[1]}"
-
-log "[INFO] First-time node launch..."
+stop_node
 start_node
-
-check_and_restart
+monitor
 ```
 
-3. Create the Expect script:
+4. Make second script executable:
 
-```bash
-nano ~/start_node.expect
-```
-
-Paste the script below, then save and exit with `Ctrl + O`, `Enter`, `Ctrl + X`:
-
-```tcl
-#!/usr/bin/expect -f
-
-set timeout 300
-set swarm [lindex $argv 0]
-set size  [lindex $argv 1]
-set logfile "$env(HOME)/rl-swarm/gensynnode.log"
-
-log_file -a $logfile
-log_user 1
-
-cd ~/rl-swarm
-spawn ./run_rl_swarm.sh
-
-expect {
-    "select a swarm" {
-        send "$swarm\r"
-        exp_continue
-    }
-    "parameters" {
-        send "$size\r"
-        exp_continue
-    }
-    "Hugging Face Hub" {
-        send "N\r"
-    }
-}
-expect eof
-```
-
-4. Make both scripts executable:
-
-```bash
-chmod +x ~/autorestart_1.sh ~/start_node.expect
-```
+`chmod +x ~/autorestart_bash.sh`
 
 5. Run the script in a screen session:
 
-```bash
-screen -S autorestart bash ~/autorestart_1.sh
-```
+`screen -S autorestart bash ~/autorestart_bash.sh`
 
 6. View logs:
 
-```bash
-tail -f ~/rl-swarm/gensynnode.log
-```
+`tail -f ~/rl-swarm/gensynnode.log`
 
----
+**Description**
 
 If the node stops due to one of the following errors:
 1. `UnboundLocalError: cannot access local variable 'current_batch'`
@@ -197,4 +133,5 @@ If the node stops due to one of the following errors:
 
 …it will automatically restart using the parameters chosen during the initial manual launch.
 
-We believe in this project and hope the issues will be fixed soon!
+We believe in this project and hope the issues will be fixed soon)
+
