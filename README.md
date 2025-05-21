@@ -54,10 +54,29 @@ COUNTER_FILE="$HOME/gensyn_restart_count.txt"
 rm -f "$PARAM_FILE"
 
 ask_params() {
-    echo "Choose swarm type (A or B):"
-    read SWARM
-    echo "Choose model size (0.5 / 1.5 / 7 / 32 / 72):"
-    read SIZE
+    # Проверка swarm
+    while true; do
+        read -rp "Choose swarm type (A or B): " SWARM
+        if [[ "$SWARM" == "A" || "$SWARM" == "B" ]]; then
+            break
+        else
+            echo "❌ Invalid input. Please enter A or B."
+        fi
+    done
+
+    # Проверка размера
+    while true; do
+        read -rp "Choose model size (0.5 / 1.5 / 7 / 32 / 72): " SIZE
+        case "$SIZE" in
+            "0.5"|"1.5"|"7"|"32"|"72")
+                break
+                ;;
+            *)
+                echo "❌ Invalid input. Please enter one of: 0.5, 1.5, 7, 32, 72"
+                ;;
+        esac
+    done
+
     echo "$SWARM" > "$PARAM_FILE"
     echo "$SIZE" >> "$PARAM_FILE"
 }
@@ -73,7 +92,7 @@ start_node() {
     readarray -t PARAMS < "$PARAM_FILE"
     SWARM="${PARAMS[0]}"
     SIZE="${PARAMS[1]}"
-    
+
     > "$LOG_FILE"
 
     screen -S gensynnode -dm bash -c "~/start_gensyn_bash.sh $SWARM $SIZE >> $LOG_FILE 2>&1"
