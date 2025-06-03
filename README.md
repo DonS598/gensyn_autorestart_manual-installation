@@ -99,7 +99,7 @@ start_node() {
 }
 
 has_error() {
-    grep -qE "current.?batch|UnboundLocalError|Daemon failed to start|FileNotFoundError" "$LOG_FILE"
+    grep -qE "current.?batch|UnboundLocalError|Daemon failed to start|FileNotFoundError|DHTNode bootstrap failed|Failed to connect to Gensyn Testnet|^Killed|argument of type 'NoneType' is not iterable" "$LOG_FILE"
 }
 
 increment_counter() {
