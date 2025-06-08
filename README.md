@@ -4,7 +4,7 @@ HOWEVER, this script is not designed for the initial installation of the node. T
 
 **Installation**
 
-0. First of all delete old run_rl_swarm.sh file:
+1. First of all delete old run_rl_swarm.sh file:
 
 ```rm /root/rl-swarm/run_rl_swarm.sh```
 
@@ -671,7 +671,7 @@ Make the script executable:
 
 ```chmod +x /root/rl-swarm/run_rl_swarm.sh```
 
-1. Create the first script:
+2. Create the second script:
 
 `nano ~/start_gensyn_bash.sh`
 
@@ -704,7 +704,7 @@ Make scrypt executable
 `chmod +x ~/start_gensyn_bash.sh`
 
 
-3. Create the second script:
+3. Create the third script:
 
 `nano ~/autorestart_bash.sh`
 
@@ -798,7 +798,7 @@ start_node
 monitor
 ```
 
-4. Make second script executable:
+4. Make third script executable:
 
 `chmod +x ~/autorestart_bash.sh`
 
