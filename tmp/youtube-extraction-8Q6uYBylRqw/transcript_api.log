@@ -1,1 +1,0 @@
-new_api: RequestBlocked() | old_api: AttributeError("type object 'YouTubeTranscriptApi' has no attribute 'get_transcript'")
