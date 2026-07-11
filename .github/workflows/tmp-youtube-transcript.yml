@@ -1,0 +1,152 @@
+name: Temporary YouTube transcript extraction
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install transcript tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade yt-dlp youtube-transcript-api
+
+      - name: Extract metadata
+        continue-on-error: true
+        run: |
+          yt-dlp --skip-download --dump-single-json --no-warnings \
+            "https://www.youtube.com/watch?v=8Q6uYBylRqw" > metadata.json
+          python - <<'PY'
+          import json
+          try:
+              data=json.load(open('metadata.json', encoding='utf-8'))
+              keep={k:data.get(k) for k in ['id','title','channel','uploader','upload_date','duration','description','chapters','tags','categories','webpage_url']}
+              print('===METADATA_JSON===')
+              print(json.dumps(keep, ensure_ascii=False, indent=2))
+              print('===END_METADATA_JSON===')
+          except Exception as e:
+              print('metadata error:', repr(e))
+          PY
+
+      - name: Try YouTube transcript API
+        id: transcript_api
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import json, sys
+          from pathlib import Path
+          from youtube_transcript_api import YouTubeTranscriptApi
+          video_id='8Q6uYBylRqw'
+          rows=[]
+          errors=[]
+          try:
+              api=YouTubeTranscriptApi()
+              fetched=api.fetch(video_id, languages=['ru','ru-RU','en','en-US'])
+              for x in fetched:
+                  rows.append({'start':float(x.start),'duration':float(x.duration),'text':x.text})
+          except Exception as e:
+              errors.append('new_api: '+repr(e))
+              try:
+                  fetched=YouTubeTranscriptApi.get_transcript(video_id, languages=['ru','ru-RU','en','en-US'])
+                  rows=[{'start':float(x['start']),'duration':float(x.get('duration',0)),'text':x['text']} for x in fetched]
+              except Exception as e2:
+                  errors.append('old_api: '+repr(e2))
+          if rows:
+              Path('transcript.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+              with open('transcript.txt','w',encoding='utf-8') as f:
+                  for r in rows:
+                      m=int(r['start']//60); s=int(r['start']%60)
+                      f.write(f'[{m:02d}:{s:02d}] {r["text"]}\n')
+              print('Transcript API succeeded:', len(rows), 'segments')
+          else:
+              print('Transcript API failed:', ' | '.join(errors))
+              sys.exit(1)
+          PY
+
+      - name: Try yt-dlp subtitles
+        if: steps.transcript_api.outcome != 'success'
+        continue-on-error: true
+        run: |
+          yt-dlp --skip-download --write-subs --write-auto-subs \
+            --sub-langs "ru.*,en.*" --sub-format vtt \
+            --extractor-args "youtube:player_client=android,web" \
+            -o "video.%(ext)s" "https://www.youtube.com/watch?v=8Q6uYBylRqw"
+          python - <<'PY'
+          from pathlib import Path
+          import re, html
+          if Path('transcript.txt').exists() and Path('transcript.txt').stat().st_size:
+              raise SystemExit
+          files=list(Path('.').glob('video*.vtt'))
+          print('VTT files:', [str(x) for x in files])
+          if not files:
+              raise SystemExit(1)
+          lines=[]; seen=set()
+          time_re=re.compile(r'^(\d\d:)?\d\d:\d\d\.\d+ -->')
+          current=''
+          for raw in files[0].read_text(encoding='utf-8', errors='ignore').splitlines():
+              line=raw.strip()
+              if time_re.match(line):
+                  current=line.split(' --> ')[0]
+                  continue
+              if not line or line.startswith(('WEBVTT','Kind:','Language:')) or line.isdigit():
+                  continue
+              text=re.sub(r'<[^>]+>','',html.unescape(line)).strip()
+              key=(current,text)
+              if text and key not in seen:
+                  seen.add(key); lines.append(f'[{current}] {text}')
+          Path('transcript.txt').write_text('\n'.join(lines), encoding='utf-8')
+          print('yt-dlp captions succeeded:', len(lines), 'lines')
+          PY
+
+      - name: Fallback audio transcription
+        if: hashFiles('transcript.txt') == ''
+        run: |
+          pip install --upgrade faster-whisper
+          yt-dlp -f "bestaudio/best" -x --audio-format mp3 \
+            --extractor-args "youtube:player_client=android,web" \
+            -o "audio.%(ext)s" "https://www.youtube.com/watch?v=8Q6uYBylRqw"
+          python - <<'PY'
+          from pathlib import Path
+          from faster_whisper import WhisperModel
+          audio=next(iter(Path('.').glob('audio.*')))
+          model=WhisperModel('small', device='cpu', compute_type='int8')
+          segments, info=model.transcribe(str(audio), language='ru', vad_filter=True, beam_size=5)
+          rows=[]
+          for seg in segments:
+              rows.append(f'[{int(seg.start//60):02d}:{int(seg.start%60):02d}] {seg.text.strip()}')
+          Path('transcript.txt').write_text('\n'.join(rows), encoding='utf-8')
+          print('Whisper language:', info.language, 'probability:', info.language_probability)
+          print('Whisper segments:', len(rows))
+          PY
+
+      - name: Print transcript
+        if: always()
+        run: |
+          echo '===TRANSCRIPT_BEGIN==='
+          if [ -f transcript.txt ]; then cat transcript.txt; else echo 'NO TRANSCRIPT'; fi
+          echo '===TRANSCRIPT_END==='
+
+      - name: Upload extraction files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: youtube-transcript-8Q6uYBylRqw
+          path: |
+            metadata.json
+            transcript.txt
+            transcript.json
+            video*.vtt
+          if-no-files-found: warn
+          retention-days: 1
