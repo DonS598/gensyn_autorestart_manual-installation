@@ -1,0 +1,2 @@
+completed_at=2026-07-11T21:39:12Z
+transcript_status=failed
