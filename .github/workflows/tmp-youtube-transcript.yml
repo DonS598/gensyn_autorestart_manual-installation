@@ -1,18 +1,21 @@
 name: Temporary YouTube transcript extraction
 
 on:
-  pull_request:
-    branches: [main]
+  push:
+    branches: [tmp-youtube-transcript-8q6uybylrqw]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   extract:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: tmp-youtube-transcript-8q6uybylrqw
 
       - uses: actions/setup-python@v5
         with:
@@ -26,16 +29,17 @@ jobs:
       - name: Extract metadata
         continue-on-error: true
         run: |
+          set -o pipefail
           yt-dlp --skip-download --dump-single-json --no-warnings \
-            "https://www.youtube.com/watch?v=8Q6uYBylRqw" > metadata.json
+            "https://www.youtube.com/watch?v=8Q6uYBylRqw" \
+            2>metadata_error.txt > metadata.json
           python - <<'PY'
           import json
           try:
               data=json.load(open('metadata.json', encoding='utf-8'))
               keep={k:data.get(k) for k in ['id','title','channel','uploader','upload_date','duration','description','chapters','tags','categories','webpage_url']}
-              print('===METADATA_JSON===')
-              print(json.dumps(keep, ensure_ascii=False, indent=2))
-              print('===END_METADATA_JSON===')
+              open('metadata_summary.json','w',encoding='utf-8').write(json.dumps(keep,ensure_ascii=False,indent=2))
+              print(json.dumps(keep,ensure_ascii=False,indent=2))
           except Exception as e:
               print('metadata error:', repr(e))
           PY
@@ -44,7 +48,7 @@ jobs:
         id: transcript_api
         continue-on-error: true
         run: |
-          python - <<'PY'
+          python - <<'PY' 2>&1 | tee transcript_api.log
           import json, sys
           from pathlib import Path
           from youtube_transcript_api import YouTubeTranscriptApi
@@ -79,11 +83,13 @@ jobs:
         if: steps.transcript_api.outcome != 'success'
         continue-on-error: true
         run: |
+          set -o pipefail
           yt-dlp --skip-download --write-subs --write-auto-subs \
             --sub-langs "ru.*,en.*" --sub-format vtt \
             --extractor-args "youtube:player_client=android,web" \
-            -o "video.%(ext)s" "https://www.youtube.com/watch?v=8Q6uYBylRqw"
-          python - <<'PY'
+            -o "video.%(ext)s" "https://www.youtube.com/watch?v=8Q6uYBylRqw" \
+            2>&1 | tee ytdlp_subtitles.log
+          python - <<'PY' 2>&1 | tee -a ytdlp_subtitles.log
           from pathlib import Path
           import re, html
           if Path('transcript.txt').exists() and Path('transcript.txt').stat().st_size:
@@ -112,12 +118,15 @@ jobs:
 
       - name: Fallback audio transcription
         if: hashFiles('transcript.txt') == ''
+        continue-on-error: true
         run: |
-          pip install --upgrade faster-whisper
+          set -o pipefail
+          pip install --upgrade faster-whisper 2>&1 | tee whisper.log
           yt-dlp -f "bestaudio/best" -x --audio-format mp3 \
             --extractor-args "youtube:player_client=android,web" \
-            -o "audio.%(ext)s" "https://www.youtube.com/watch?v=8Q6uYBylRqw"
-          python - <<'PY'
+            -o "audio.%(ext)s" "https://www.youtube.com/watch?v=8Q6uYBylRqw" \
+            2>&1 | tee -a whisper.log
+          python - <<'PY' 2>&1 | tee -a whisper.log
           from pathlib import Path
           from faster_whisper import WhisperModel
           audio=next(iter(Path('.').glob('audio.*')))
@@ -131,22 +140,24 @@ jobs:
           print('Whisper segments:', len(rows))
           PY
 
-      - name: Print transcript
+      - name: Persist extraction result to temporary branch
         if: always()
         run: |
-          echo '===TRANSCRIPT_BEGIN==='
-          if [ -f transcript.txt ]; then cat transcript.txt; else echo 'NO TRANSCRIPT'; fi
-          echo '===TRANSCRIPT_END==='
-
-      - name: Upload extraction files
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: youtube-transcript-8Q6uYBylRqw
-          path: |
-            metadata.json
-            transcript.txt
-            transcript.json
-            video*.vtt
-          if-no-files-found: warn
-          retention-days: 1
+          mkdir -p tmp/youtube-extraction-8Q6uYBylRqw
+          for f in metadata.json metadata_summary.json metadata_error.txt transcript.txt transcript.json transcript_api.log ytdlp_subtitles.log whisper.log video*.vtt; do
+            if compgen -G "$f" > /dev/null; then cp $f tmp/youtube-extraction-8Q6uYBylRqw/; fi
+          done
+          {
+            echo "completed_at=$(date -u +%FT%TZ)"
+            if [ -s transcript.txt ]; then
+              echo "transcript_status=success"
+              echo "transcript_lines=$(wc -l < transcript.txt)"
+            else
+              echo "transcript_status=failed"
+            fi
+          } > tmp/youtube-extraction-8Q6uYBylRqw/status.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tmp/youtube-extraction-8Q6uYBylRqw
+          git commit -m "chore: save temporary YouTube transcript result [skip ci]" || exit 0
+          git push origin HEAD:tmp-youtube-transcript-8q6uybylrqw
