@@ -1,4 +1,4 @@
-name: Temporary YouTube transcript main trigger
+name: Temporary YouTube transcript splitter
 
 on:
   push:
@@ -8,141 +8,44 @@ permissions:
   contents: write
 
 jobs:
-  extract:
+  split:
     if: contains(github.event.head_commit.message, 'temporary YouTube extraction trigger')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           ref: tmp-youtube-transcript-8q6uybylrqw
-
-      - name: Probe transcript APIs
-        continue-on-error: true
+      - name: Split transcript into readable chunks
         run: |
-          echo "started $(date -u +%FT%TZ)" > probe_started.txt
-          python3 - <<'PY' > direct_probe.log 2>&1
-          import html, json, re, sys
+          python3 - <<'PY'
           from pathlib import Path
-          from urllib.request import Request, urlopen
-          from urllib.parse import urljoin, quote
-
-          VID='8Q6uYBylRqw'
-          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36'
-          def fetch(url, timeout=20):
-              print('GET',url,flush=True)
-              req=Request(url,headers={'User-Agent':UA,'Accept':'*/*'})
-              with urlopen(req,timeout=timeout) as r:
-                  body=r.read()
-                  print('STATUS',getattr(r,'status',None),'TYPE',r.headers.get('content-type'),'BYTES',len(body),flush=True)
-                  return body,r.headers.get('content-type','')
-          def parse_rows(text):
-              text=text.strip(); rows=[]
-              if not text:return rows
-              try:
-                  obj=json.loads(text)
-                  if isinstance(obj,dict) and 'events' in obj:
-                      for ev in obj.get('events',[]):
-                          t=''.join(s.get('utf8','') for s in ev.get('segs') or []).replace('\n',' ').strip()
-                          if t: rows.append({'start':float(ev.get('tStartMs',0))/1000,'duration':float(ev.get('dDurationMs',0))/1000,'text':t})
-                      if rows:return rows
-              except Exception:pass
-              if '<text' in text:
-                  for m in re.finditer(r'<text[^>]*start="([0-9.]+)"[^>]*(?:dur="([0-9.]+)")?[^>]*>(.*?)</text>',text,re.S):
-                      rows.append({'start':float(m.group(1)),'duration':float(m.group(2) or 0),'text':re.sub(r'<[^>]+>','',html.unescape(m.group(3))).strip()})
-                  if rows:return rows
-              cur=0.0; seen=set(); tr=re.compile(r'(?:(\d+):)?(\d{2}):(\d{2})[.,](\d{3})\s*-->')
-              for raw in text.splitlines():
-                  line=raw.strip(); m=tr.search(line)
-                  if m:
-                      cur=int(m.group(1) or 0)*3600+int(m.group(2))*60+int(m.group(3))+int(m.group(4))/1000; continue
-                  if not line or line.isdigit() or line.startswith(('WEBVTT','Kind:','Language:','NOTE')):continue
-                  clean=re.sub(r'<[^>]+>','',html.unescape(line)).strip(); key=(round(cur,2),clean)
-                  if clean and key not in seen:seen.add(key); rows.append({'start':cur,'duration':0,'text':clean})
-              return rows
-          def save_rows(rows,source):
-              clean=[];prev=None
-              for r in rows:
-                  t=' '.join(str(r.get('text','')).split())
-                  if not t or t==prev:continue
-                  prev=t;clean.append({'start':float(r.get('start',0)),'duration':float(r.get('duration',0)),'text':t})
-              if not clean:return False
-              Path('transcript.json').write_text(json.dumps(clean,ensure_ascii=False,indent=2),encoding='utf-8')
-              with open('transcript.txt','w',encoding='utf-8') as f:
-                  for r in clean:f.write(f'[{int(r["start"]//60):02d}:{int(r["start"]%60):02d}] {r["text"]}\n')
-              Path('transcript_source.txt').write_text(source,encoding='utf-8')
-              print('SAVED ROWS',len(clean),source,flush=True)
-              return True
-          direct=[
-            f'https://transcript-yt-ten.vercel.app/api/transcript?videoId={VID}',
-            f'https://youtube-transcript-api.vercel.app/api/transcript?video_id={VID}',
-            f'https://yt-transcript-api.vercel.app/api/transcript?id={VID}',
-            f'https://www.youtube.com/api/timedtext?v={VID}&lang=ru',
-            f'https://www.youtube.com/api/timedtext?v={VID}&lang=en'
-          ]
-          for i,u in enumerate(direct):
-              try:
-                  body,ct=fetch(u)
-                  Path(f'direct_response_{i}.bin').write_bytes(body)
-                  text=body.decode('utf-8','replace')
-                  print('PREVIEW',repr(text[:500]),flush=True)
-                  try:data=json.loads(text)
-                  except Exception:data=None
-                  if isinstance(data,dict):
-                      Path(f'direct_response_{i}.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
-                      tr=data.get('transcript') or data.get('text') or data.get('captions')
-                      if isinstance(tr,str) and tr.strip():
-                          Path('transcript.txt').write_text(tr.strip(),encoding='utf-8')
-                          Path('transcript_source.txt').write_text(u,encoding='utf-8')
-                          meta={k:data.get(k) for k in ['title','channel','author','duration','description'] if k in data}
-                          Path('metadata_summary.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
-                          print('SAVED STRING TRANSCRIPT',len(tr),u,flush=True);sys.exit(0)
-                      if isinstance(tr,list):
-                          rows=[]
-                          for x in tr:
-                              if isinstance(x,dict):rows.append({'start':x.get('start',x.get('offset',0)),'duration':x.get('duration',0),'text':x.get('text','')})
-                              elif isinstance(x,str):rows.append({'start':0,'duration':0,'text':x})
-                          if save_rows(rows,u):sys.exit(0)
-                  rows=parse_rows(text)
-                  if save_rows(rows,u):sys.exit(0)
-              except Exception as e:print('DIRECT ERROR',u,type(e).__name__,e,flush=True)
-
-          piped=['https://pipedapi.adminforge.de','https://pipedapi.reallyaweso.me','https://pipedapi.privacy.com.de','https://pipedapi.leptons.xyz','https://pipedapi.r4fo.com','https://pipedapi.kavin.rocks']
-          for base in piped:
-              try:
-                  body,ct=fetch(f'{base}/streams/{VID}')
-                  data=json.loads(body.decode('utf-8','replace'))
-                  Path('piped_response.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
-                  meta={k:data.get(k) for k in ['title','description','duration','uploadDate','uploader','uploaderName','chapters'] if k in data}
-                  meta['source']=base;Path('metadata_summary.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
-                  subs=data.get('subtitles') or []
-                  subs=sorted(subs,key=lambda s:0 if str(s.get('code','')).lower().startswith('ru') else 1 if str(s.get('code','')).lower().startswith('en') else 2)
-                  for sub in subs:
-                      su=sub.get('url')
-                      if not su:continue
-                      su=urljoin(base+'/',su)
-                      sb,sct=fetch(su)
-                      rows=parse_rows(sb.decode('utf-8','replace'))
-                      if save_rows(rows,f'{base}:{sub.get("code") or sub.get("name")}'):sys.exit(0)
-              except Exception as e:print('PIPED ERROR',base,type(e).__name__,e,flush=True)
-          print('NO TRANSCRIPT FOUND',flush=True)
-          sys.exit(2)
+          import json,re
+          root=Path('tmp/youtube-extraction-8Q6uYBylRqw')
+          text=(root/'transcript.txt').read_text(encoding='utf-8')
+          out=root/'chunks'
+          if out.exists():
+              for p in out.glob('*'): p.unlink()
+          out.mkdir(exist_ok=True)
+          # Split on sentence boundaries, keeping each file below about 3200 chars.
+          sentences=re.split(r'(?<=[.!?])\s+',text)
+          chunks=[]; current=''
+          for s in sentences:
+              if not s: continue
+              if len(current)+len(s)+1>3200 and current:
+                  chunks.append(current.strip()); current=s
+              else:
+                  current=(current+' '+s).strip()
+          if current: chunks.append(current.strip())
+          index=[]
+          for i,ch in enumerate(chunks,1):
+              p=out/f'part-{i:02d}.txt'
+              p.write_text(ch,encoding='utf-8')
+              index.append({'part':i,'file':str(p),'chars':len(ch),'preview':ch[:160]})
+          (root/'chunk_index.json').write_text(json.dumps(index,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('chunks',len(chunks),'chars',len(text))
           PY
-
-      - name: Commit result to temporary branch
-        if: always()
-        run: |
-          rm -rf tmp/youtube-extraction-8Q6uYBylRqw
-          mkdir -p tmp/youtube-extraction-8Q6uYBylRqw
-          for f in probe_started.txt direct_probe.log metadata_summary.json transcript.txt transcript.json transcript_source.txt piped_response.json direct_response_*; do
-            if compgen -G "$f" > /dev/null; then cp $f tmp/youtube-extraction-8Q6uYBylRqw/; fi
-          done
-          {
-            echo "completed_at=$(date -u +%FT%TZ)"
-            if [ -s transcript.txt ]; then echo transcript_status=success; echo "transcript_lines=$(wc -l < transcript.txt)"; else echo transcript_status=failed; fi
-          } > tmp/youtube-extraction-8Q6uYBylRqw/status.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A tmp/youtube-extraction-8Q6uYBylRqw
-          git commit -m "chore: save direct YouTube transcript result [skip ci]" || exit 0
+          git add tmp/youtube-extraction-8Q6uYBylRqw/chunks tmp/youtube-extraction-8Q6uYBylRqw/chunk_index.json
+          git commit -m "chore: split temporary YouTube transcript [skip ci]" || exit 0
           git push origin HEAD:tmp-youtube-transcript-8q6uybylrqw
