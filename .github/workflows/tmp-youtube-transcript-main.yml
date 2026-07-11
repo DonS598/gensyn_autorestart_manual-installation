@@ -24,107 +24,224 @@ jobs:
       - name: Install tools
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade yt-dlp youtube-transcript-api
+          pip install --upgrade requests
 
-      - name: Metadata
+      - name: Try Piped and Invidious APIs
         continue-on-error: true
         run: |
-          yt-dlp --skip-download --dump-single-json --no-warnings \
-            "https://www.youtube.com/watch?v=8Q6uYBylRqw" \
-            2>metadata_error.txt > metadata.json
-          python - <<'PY'
-          import json
+          python - <<'PY' 2>&1 | tee proxy_extraction.log
+          import html, json, re, sys, time
           from pathlib import Path
-          try:
-              data=json.load(open('metadata.json',encoding='utf-8'))
-              keep={k:data.get(k) for k in ['id','title','channel','uploader','upload_date','duration','description','chapters','tags','categories','webpage_url']}
-              Path('metadata_summary.json').write_text(json.dumps(keep,ensure_ascii=False,indent=2),encoding='utf-8')
-          except Exception as e:
-              Path('metadata_parse_error.txt').write_text(repr(e),encoding='utf-8')
-          PY
+          from urllib.parse import urljoin
+          import requests
 
-      - name: Transcript API
-        id: api
-        continue-on-error: true
-        run: |
-          python - <<'PY' 2>&1 | tee transcript_api.log
-          import json, sys
-          from pathlib import Path
-          from youtube_transcript_api import YouTubeTranscriptApi
-          vid='8Q6uYBylRqw'; rows=[]; errors=[]
-          try:
-              fetched=YouTubeTranscriptApi().fetch(vid,languages=['ru','ru-RU','en','en-US'])
-              rows=[{'start':float(x.start),'duration':float(x.duration),'text':x.text} for x in fetched]
-          except Exception as e:
-              errors.append('new_api: '+repr(e))
+          VIDEO='8Q6uYBylRqw'
+          S=requests.Session()
+          S.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126 Safari/537.36'})
+          log=[]
+          def note(x):
+              x=str(x); print(x, flush=True); log.append(x)
+          def get(url, **kw):
+              return S.get(url, timeout=kw.pop('timeout',12), allow_redirects=True, **kw)
+          def rows_from_text(text, content_type=''):
+              text=text.strip(); rows=[]
+              if not text: return rows
+              # YouTube json3
               try:
-                  fetched=YouTubeTranscriptApi.get_transcript(vid,languages=['ru','ru-RU','en','en-US'])
-                  rows=[{'start':float(x['start']),'duration':float(x.get('duration',0)),'text':x['text']} for x in fetched]
-              except Exception as e2:
-                  errors.append('old_api: '+repr(e2))
-          if not rows:
-              print(' | '.join(errors)); sys.exit(1)
-          Path('transcript.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
-          with open('transcript.txt','w',encoding='utf-8') as f:
+                  obj=json.loads(text)
+                  if isinstance(obj,dict) and 'events' in obj:
+                      for ev in obj.get('events',[]):
+                          segs=ev.get('segs') or []
+                          t=''.join(s.get('utf8','') for s in segs).replace('\n',' ').strip()
+                          if t:
+                              rows.append({'start':float(ev.get('tStartMs',0))/1000,'duration':float(ev.get('dDurationMs',0))/1000,'text':t})
+                      if rows: return rows
+              except Exception: pass
+              # timedtext XML
+              if '<text' in text and ('start=' in text or '<transcript' in text):
+                  for m in re.finditer(r'<text[^>]*start="([0-9.]+)"[^>]*(?:dur="([0-9.]+)")?[^>]*>(.*?)</text>',text,re.S):
+                      rows.append({'start':float(m.group(1)),'duration':float(m.group(2) or 0),'text':re.sub(r'<[^>]+>','',html.unescape(m.group(3))).replace('\n',' ').strip()})
+                  if rows: return rows
+              # VTT/SRT
+              current=0.0; seen=set()
+              time_re=re.compile(r'(?:(\d+):)?(\d{2}):(\d{2})[.,](\d{3})\s*-->')
+              for raw in text.splitlines():
+                  line=raw.strip()
+                  tm=time_re.search(line)
+                  if tm:
+                      h=int(tm.group(1) or 0); current=h*3600+int(tm.group(2))*60+int(tm.group(3))+int(tm.group(4))/1000
+                      continue
+                  if not line or line.isdigit() or line.startswith(('WEBVTT','Kind:','Language:','NOTE')): continue
+                  clean=re.sub(r'<[^>]+>','',html.unescape(line)).strip()
+                  key=(round(current,2),clean)
+                  if clean and key not in seen:
+                      seen.add(key); rows.append({'start':current,'duration':0,'text':clean})
+              return rows
+          def save_rows(rows, source):
+              if not rows: return False
+              # remove exact consecutive duplicates
+              clean=[]; prev=None
               for r in rows:
-                  f.write(f'[{int(r["start"]//60):02d}:{int(r["start"]%60):02d}] {r["text"]}\n')
-          print('segments',len(rows))
+                  txt=' '.join(str(r.get('text','')).split())
+                  if not txt or txt==prev: continue
+                  prev=txt; clean.append({'start':float(r.get('start',0)),'duration':float(r.get('duration',0)),'text':txt})
+              Path('transcript.json').write_text(json.dumps(clean,ensure_ascii=False,indent=2),encoding='utf-8')
+              with open('transcript.txt','w',encoding='utf-8') as f:
+                  for r in clean:
+                      f.write(f'[{int(r["start"]//60):02d}:{int(r["start"]%60):02d}] {r["text"]}\n')
+              Path('transcript_source.txt').write_text(source,encoding='utf-8')
+              note(f'SAVED {len(clean)} rows from {source}')
+              return True
+          def save_metadata(data, source):
+              keep={k:data.get(k) for k in ['title','description','duration','uploadDate','uploader','uploaderName','uploaderUrl','views','likes','category','chapters'] if k in data}
+              keep['source']=source
+              Path('metadata_summary.json').write_text(json.dumps(keep,ensure_ascii=False,indent=2),encoding='utf-8')
+          def download_audio(url, source):
+              try:
+                  note(f'audio try {source}: {url[:160]}')
+                  r=get(url,timeout=30,stream=True)
+                  note(f'audio status {r.status_code} type={r.headers.get("content-type")} len={r.headers.get("content-length")}')
+                  r.raise_for_status()
+                  ext='.webm'
+                  ct=(r.headers.get('content-type') or '').lower()
+                  if 'mp4' in ct or 'm4a' in ct: ext='.m4a'
+                  p=Path('audio_proxy'+ext)
+                  total=0
+                  with p.open('wb') as f:
+                      for chunk in r.iter_content(1024*1024):
+                          if chunk:
+                              f.write(chunk); total+=len(chunk)
+                              if total>250*1024*1024: raise RuntimeError('audio too large')
+                  note(f'audio saved {p} bytes={total}')
+                  Path('audio_source.txt').write_text(source,encoding='utf-8')
+                  return total>10000
+              except Exception as e:
+                  note(f'audio fail {source}: {type(e).__name__}: {e}')
+                  return False
+
+          piped=[]
+          for list_url in ['https://piped.video/api/v1/instances','https://piped.video/api/v1/instances.json']:
+              try:
+                  r=get(list_url); note(f'instance list {list_url}: {r.status_code}')
+                  data=r.json()
+                  for x in data if isinstance(data,list) else []:
+                      if isinstance(x,dict):
+                          u=x.get('api_url') or x.get('apiUrl') or x.get('api')
+                          if isinstance(u,str) and u.startswith('http'): piped.append(u.rstrip('/'))
+              except Exception as e: note(f'instance list error {list_url}: {e}')
+          piped += [
+              'https://pipedapi.adminforge.de','https://pipedapi.reallyaweso.me',
+              'https://pipedapi.privacy.com.de','https://pipedapi.leptons.xyz',
+              'https://pipedapi.r4fo.com','https://pipedapi.kavin.rocks'
+          ]
+          seen=set(); piped=[x for x in piped if not (x in seen or seen.add(x))][:30]
+          audio_candidates=[]
+          for base in piped:
+              try:
+                  url=f'{base}/streams/{VIDEO}'
+                  r=get(url); note(f'PIPED {base}: {r.status_code} {r.headers.get("content-type")}')
+                  if r.status_code!=200: continue
+                  data=r.json(); save_metadata(data,'piped:'+base)
+                  Path('piped_response.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+                  subs=data.get('subtitles') or []
+                  subs=sorted(subs,key=lambda s:(0 if str(s.get('code','')).lower().startswith('ru') else 1 if str(s.get('code','')).lower().startswith('en') else 2, bool(s.get('autoGenerated'))))
+                  for sub in subs:
+                      su=sub.get('url')
+                      if not su: continue
+                      su=urljoin(base+'/',su)
+                      try:
+                          sr=get(su); note(f' subtitle {sub.get("code") or sub.get("name")} {sr.status_code} {su[:130]}')
+                          if sr.status_code==200:
+                              rows=rows_from_text(sr.text,sr.headers.get('content-type',''))
+                              if save_rows(rows,f'piped:{base}:{sub.get("code") or sub.get("name")}'): sys.exit(0)
+                      except Exception as e: note(f' subtitle error: {e}')
+                  for a in data.get('audioStreams') or []:
+                      if a.get('url'): audio_candidates.append((a.get('bitrate') or 999999999,a.get('url'),f'piped:{base}'))
+              except SystemExit: raise
+              except Exception as e: note(f'PIPED error {base}: {type(e).__name__}: {e}')
+
+          inv=[]
+          try:
+              r=get('https://api.invidious.io/instances.json'); note(f'invidious list: {r.status_code}')
+              for domain,info in r.json():
+                  if isinstance(info,dict) and info.get('api'):
+                      uri=info.get('uri') or ('https://'+domain)
+                      if uri.startswith('http'): inv.append(uri.rstrip('/'))
+          except Exception as e: note(f'invidious list error: {e}')
+          inv += ['https://inv.nadeko.net','https://yewtu.be','https://invidious.nerdvpn.de','https://invidious.private.coffee','https://inv.us.projectsegfau.lt','https://inv.tux.pizza']
+          seen=set(); inv=[x for x in inv if not (x in seen or seen.add(x))][:35]
+          for base in inv:
+              try:
+                  cap=f'{base}/api/v1/captions/{VIDEO}'
+                  r=get(cap); note(f'INVIDIOUS captions {base}: {r.status_code} {r.headers.get("content-type")}')
+                  if r.status_code==200:
+                      try: data=r.json()
+                      except Exception: data=None
+                      tracks=[]
+                      if isinstance(data,dict): tracks=data.get('captions') or data.get('captionTracks') or []
+                      elif isinstance(data,list): tracks=data
+                      tracks=sorted(tracks,key=lambda s:(0 if str(s.get('language_code') or s.get('languageCode') or '').lower().startswith('ru') else 1 if str(s.get('language_code') or s.get('languageCode') or '').lower().startswith('en') else 2))
+                      for t in tracks:
+                          tu=t.get('url')
+                          if not tu:
+                              label=t.get('label')
+                              if label: tu=cap+'?label='+requests.utils.quote(str(label))
+                          if not tu: continue
+                          tu=urljoin(base+'/',tu)
+                          tr=get(tu); note(f' caption track {tr.status_code} {tu[:130]}')
+                          if tr.status_code==200 and save_rows(rows_from_text(tr.text,tr.headers.get('content-type','')),f'invidious:{base}'):
+                              sys.exit(0)
+                  vr=get(f'{base}/api/v1/videos/{VIDEO}'); note(f'INVIDIOUS video {base}: {vr.status_code}')
+                  if vr.status_code==200:
+                      data=vr.json(); save_metadata(data,'invidious:'+base)
+                      Path('invidious_response.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+                      for a in data.get('adaptiveFormats') or []:
+                          typ=str(a.get('type') or '').lower()
+                          if typ.startswith('audio') and a.get('url'):
+                              audio_candidates.append((a.get('bitrate') or 999999999,a.get('url'),f'invidious:{base}'))
+              except SystemExit: raise
+              except Exception as e: note(f'INVIDIOUS error {base}: {type(e).__name__}: {e}')
+
+          audio_candidates.sort(key=lambda x:x[0])
+          note(f'audio candidates={len(audio_candidates)}')
+          for _,url,src in audio_candidates[:20]:
+              if download_audio(url,src): break
+          Path('proxy_extraction_internal.log').write_text('\n'.join(log),encoding='utf-8')
+          if not any(Path('.').glob('audio_proxy.*')):
+              sys.exit(2)
           PY
 
-      - name: yt-dlp subtitles fallback
-        if: steps.api.outcome != 'success'
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          yt-dlp --skip-download --write-subs --write-auto-subs \
-            --sub-langs "ru.*,en.*" --sub-format vtt \
-            --extractor-args "youtube:player_client=android,web" \
-            -o "video.%(ext)s" "https://www.youtube.com/watch?v=8Q6uYBylRqw" \
-            2>&1 | tee ytdlp_subtitles.log
-          python - <<'PY' 2>&1 | tee -a ytdlp_subtitles.log
-          from pathlib import Path
-          import re,html
-          if Path('transcript.txt').exists() and Path('transcript.txt').stat().st_size: raise SystemExit
-          fs=list(Path('.').glob('video*.vtt'))
-          if not fs: raise SystemExit(1)
-          out=[]; seen=set(); cur=''
-          tr=re.compile(r'^(\d\d:)?\d\d:\d\d\.\d+ -->')
-          for raw in fs[0].read_text(encoding='utf-8',errors='ignore').splitlines():
-              line=raw.strip()
-              if tr.match(line): cur=line.split(' --> ')[0]; continue
-              if not line or line.startswith(('WEBVTT','Kind:','Language:')) or line.isdigit(): continue
-              text=re.sub(r'<[^>]+>','',html.unescape(line)).strip()
-              key=(cur,text)
-              if text and key not in seen: seen.add(key); out.append(f'[{cur}] {text}')
-          Path('transcript.txt').write_text('\n'.join(out),encoding='utf-8')
-          PY
-
-      - name: Whisper fallback
-        if: hashFiles('transcript.txt') == ''
+      - name: Transcribe proxy audio with Whisper
+        if: hashFiles('transcript.txt') == '' && hashFiles('audio_proxy.*') != ''
         continue-on-error: true
         run: |
           set -o pipefail
           pip install --upgrade faster-whisper 2>&1 | tee whisper.log
-          yt-dlp -f "bestaudio/best" -x --audio-format mp3 \
-            --extractor-args "youtube:player_client=android,web" \
-            -o "audio.%(ext)s" "https://www.youtube.com/watch?v=8Q6uYBylRqw" \
-            2>&1 | tee -a whisper.log
           python - <<'PY' 2>&1 | tee -a whisper.log
           from pathlib import Path
           from faster_whisper import WhisperModel
-          audio=next(iter(Path('.').glob('audio.*')))
+          audio=next(iter(Path('.').glob('audio_proxy.*')))
           model=WhisperModel('small',device='cpu',compute_type='int8')
           segs,info=model.transcribe(str(audio),language='ru',vad_filter=True,beam_size=5)
-          rows=[f'[{int(s.start//60):02d}:{int(s.start%60):02d}] {s.text.strip()}' for s in segs]
-          Path('transcript.txt').write_text('\n'.join(rows),encoding='utf-8')
+          rows=[]
+          for s in segs:
+              txt=s.text.strip()
+              if txt: rows.append({'start':float(s.start),'duration':float(s.end-s.start),'text':txt})
+          import json
+          Path('transcript.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('transcript.txt','w',encoding='utf-8') as f:
+              for r in rows: f.write(f'[{int(r["start"]//60):02d}:{int(r["start"]%60):02d}] {r["text"]}\n')
+          Path('transcript_source.txt').write_text('whisper:'+Path('audio_source.txt').read_text(encoding='utf-8'),encoding='utf-8')
+          print('language',info.language,'probability',info.language_probability,'segments',len(rows))
           PY
 
       - name: Commit result to temporary branch
         if: always()
         run: |
+          rm -rf tmp/youtube-extraction-8Q6uYBylRqw
           mkdir -p tmp/youtube-extraction-8Q6uYBylRqw
-          for f in metadata.json metadata_summary.json metadata_error.txt metadata_parse_error.txt transcript.txt transcript.json transcript_api.log ytdlp_subtitles.log whisper.log video*.vtt; do
-            if compgen -G "$f" > /dev/null; then cp $f tmp/youtube-extraction-8Q6uYBylRqw/; fi
+          for f in metadata_summary.json transcript.txt transcript.json transcript_source.txt audio_source.txt proxy_extraction.log proxy_extraction_internal.log whisper.log piped_response.json invidious_response.json; do
+            if [ -f "$f" ]; then cp "$f" tmp/youtube-extraction-8Q6uYBylRqw/; fi
           done
           {
             echo "completed_at=$(date -u +%FT%TZ)"
@@ -132,6 +249,6 @@ jobs:
           } > tmp/youtube-extraction-8Q6uYBylRqw/status.txt
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add tmp/youtube-extraction-8Q6uYBylRqw
-          git commit -m "chore: save temporary YouTube transcript result [skip ci]" || exit 0
+          git add -A tmp/youtube-extraction-8Q6uYBylRqw
+          git commit -m "chore: save proxied YouTube transcript result [skip ci]" || exit 0
           git push origin HEAD:tmp-youtube-transcript-8q6uybylrqw
